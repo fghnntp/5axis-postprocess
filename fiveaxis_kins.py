@@ -189,7 +189,6 @@ class MachineConfig:
         self.machine_type: MachineType = None
 
         # 线性轴配置
-        se
         linear_axes: Tuple[str, str, str] = ('X', 'Y', 'Z')  # 线性轴名称
 
         # 旋转轴配置
@@ -206,6 +205,7 @@ class MachineConfig:
 
         # 刀具参数
         self.tool_direction: str = 'Z'  # 默认刀具方向(可能为XYZ,通常为Z轴)
+        self.tool_axis_sign: int = +1   # +1 取变换矩阵的正列；-1 取反（常见“刀轴 = -Z”）
         self.spindle_swing_offset: np.ndarray = None  # 主轴中心到第二旋转中心的偏移, 通常只有摆头有这个偏移量
         self.tool_length: float = 0.0  # 刀具长度(刀尖到旋转中心的距离)
 
@@ -268,48 +268,52 @@ class KinematicSolver:
             raise ValueError("刀具长度必须大于等于0")
 
     def _build_transformation_matrices(self):
-        """根据机床配置构建变换矩阵（改进版）
-
-        现在正确处理旋转轴方向和偏转矢量，使用Rodrigues旋转公式构建旋转矩阵
         """
-        # 1. 构建平移变换矩阵
-        # 从机床基座到主旋转轴的变换
-        self.T_base_to_primary = self._build_translation_matrix(self.config.primary_rotary_center)
+        根据机床配置构建变换矩阵（保持右乘链路）
+        - 先确定两根旋转轴的实际方向（含 deflection）
+        - 再把“世界坐标下的偏移”一次性转成“零位局部”偏移
+        - 最后按右乘顺序构建各段平移/旋转
+        """
+        # 0) 名称
+        axis1_name = self.config.rotary_axes[0].value  # 'A'/'B'/'C'
+        axis2_name = self.config.rotary_axes[1].value
 
-        # 从主旋转轴到次旋转轴的变换
-        offset = self.config.secondary_rotary_offset
-        self.T_primary_to_secondary = self._build_translation_matrix(offset)
-
-        # 从次旋转轴到刀具的变换
-        tool_offset = np.array([0, 0, -self.config.tool_length])
-        self.T_secondary_to_tool = self._build_translation_matrix(tool_offset)
-
-        # 2. 确定旋转轴方向向量（考虑deflection和旋转方向）
-        # 获取标准旋转轴向量
+        # 1) 旋转轴实际方向（含 deflection）
         primary_std_axis = self._get_standard_axis_vector(self.config.rotary_axes[0])
         secondary_std_axis = self._get_standard_axis_vector(self.config.rotary_axes[1])
 
-        # 应用偏转矢量（如果有）
-        self.primary_axis = self.config.primary_deflection if self.config.primary_deflection is not None \
-            else primary_std_axis
-        self.secondary_axis = self.config.secondary_deflection if self.config.secondary_deflection is not None \
-            else secondary_std_axis
+        self.primary_axis = (self.config.primary_deflection
+                            if self.config.primary_deflection is not None else primary_std_axis)
+        self.secondary_axis = (self.config.secondary_deflection
+                            if self.config.secondary_deflection is not None else secondary_std_axis)
 
-        # 标准化方向向量
         self.primary_axis = self.primary_axis / np.linalg.norm(self.primary_axis)
         self.secondary_axis = self.secondary_axis / np.linalg.norm(self.secondary_axis)
 
-        # 3. 确定旋转方向（考虑旋转轴方向设置）
-        self.primary_rotation_sign = self.config.rotary_axes_direction[0] if self.config.rotary_axes_direction else 1
+        # 2) 旋向
+        self.primary_rotation_sign  = self.config.rotary_axes_direction[0] if self.config.rotary_axes_direction else 1
         self.secondary_rotation_sign = self.config.rotary_axes_direction[1] if self.config.rotary_axes_direction else 1
 
-        # 4.摆头偏移矩阵应在需要时构建
+        # 3) 世界 -> 主轴心（世界量，直接用）
+        self.T_base_to_primary = self._build_translation_matrix(self.config.primary_rotary_center)
+
+        # 4) 世界偏移 -> 一次性转“零位局部”，再做右乘平移
+        sec_off_world = np.asarray(self.config.secondary_rotary_offset, dtype=float)
+        sec_off_local0 = self._world_offset_to_local_zero(axis1_name, self.primary_axis, sec_off_world)
+        self.T_primary_to_secondary = self._build_translation_matrix(sec_off_local0)
+
+        # 5) 摆头偏移（若有）：同理，属于“第二轴的局部坐标”
         if self.config.spindle_swing_offset is not None:
-            self.spindle_swing_matrix = self._build_translation_matrix(
-                self.config.spindle_swing_offset
-            )
+            swing_off_world = np.asarray(self.config.spindle_swing_offset, dtype=float)
+            swing_off_local0 = self._world_offset_to_local_zero(axis2_name, self.secondary_axis, swing_off_world)
+            self.spindle_swing_matrix = self._build_translation_matrix(swing_off_local0)
         else:
             self.spindle_swing_matrix = np.eye(4)
+
+        # 6) 刀长（沿刀具坐标系的 -Z，留给正解链路处理；此处只是一段固定平移）
+        tool_offset = np.array([0.0, 0.0, -self.config.tool_length], dtype=float)
+        self.T_secondary_to_tool = self._build_translation_matrix(tool_offset)
+
 
     def _get_standard_axis_vector(self, axis: RotaryAxis) -> np.ndarray:
         """获取标准旋转轴向量
@@ -368,6 +372,49 @@ class KinematicSolver:
             np.array([0, 0, 0, 1])
         ])
 
+    def _local_basis_from_axis(self, axis_name: str, axis_dir_world: np.ndarray,
+                           up_hint_world: np.ndarray = np.array([0.0, 0.0, 1.0])) -> np.ndarray:
+        """
+        构造“该转轴零位的局部基”到世界的旋转矩阵 R_local0_to_world（列为局部基在世界中的表达）。
+        约定：A 绕局部 x 转，B 绕局部 y 转，C 绕局部 z 转。
+        """
+        u = axis_dir_world / np.linalg.norm(axis_dir_world)
+
+        def orth(ref, avoid):
+            v = ref - np.dot(ref, avoid) * avoid
+            if np.linalg.norm(v) < 1e-6:
+                # 退化时换一个参考方向
+                alt = np.array([1.0, 0.0, 0.0]) if abs(avoid[2]) > 0.9 else np.array([0.0, 0.0, 1.0])
+                v = alt - np.dot(alt, avoid) * avoid
+            return v / np.linalg.norm(v)
+
+        if axis_name == 'A':           # 局部 x 指向旋转轴方向
+            ex = u
+            ey = orth(up_hint_world, ex)
+            ez = np.cross(ex, ey)
+            R = np.column_stack([ex, ey, ez])
+        elif axis_name == 'B':         # 局部 y 指向旋转轴方向
+            ey = u
+            ex = orth(up_hint_world, ey)
+            ez = np.cross(ex, ey)
+            R = np.column_stack([ex, ey, ez])
+        else:                          # 'C'：局部 z 指向旋转轴方向
+            ez = u
+            ex = orth(up_hint_world, ez)
+            ey = np.cross(ez, ex)
+            R = np.column_stack([ex, ey, ez])
+
+        return R
+
+    def _world_offset_to_local_zero(self, axis_name: str, axis_dir_world: np.ndarray,
+                                    offset_world: np.ndarray) -> np.ndarray:
+        """
+        把“世界/工件坐标下测量得到的偏移向量”换算成“该轴零位的局部坐标下的偏移向量”。
+        """
+        R_l2w = self._local_basis_from_axis(axis_name, axis_dir_world)
+        return R_l2w.T @ offset_world
+
+
     def forward_kinematics(self, joint_values: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
         """
         计算五轴机床的正向运动学（刀具位置和方向）
@@ -421,6 +468,8 @@ class KinematicSolver:
         # 5. 提取刀具方向向量：取变换矩阵的第 tool_dir_index 列（0->X,1->Y,2->Z）
         tool_dir_index = _TOOL_DIRECTION_MAP.get(self.config.tool_direction, 2)
         orientation = T_total[:3, tool_dir_index].astype(float)
+        # 应用刀轴符号（+1 取正列，-1 取反列）
+        orientation *= float(getattr(self.config, "tool_axis_sign", +1))
 
         # 6. 归一化方向并返回（并在异常情况下提供诊断）
         norm = np.linalg.norm(orientation)
@@ -1015,10 +1064,11 @@ if __name__ == '__main__':
     config.machine_type = MachineType.TABLE_SPINDLE_TILTING
     config.rotary_axes = (RotaryAxis.A, RotaryAxis.B)
     config.primary_rotary_center = np.array([455, 0, 650])
-    config.secondary_rotary_offset = np.array([0, 429.813, 457.164])
+    # config.secondary_rotary_offset = np.array([0, 429.813, 457.164])
     config.secondary_rotary_offset = np.array([-455, 250, -850])
-    config.secondary_deflection = np.array([0, 0.7660, 0.643])
+    # config.secondary_deflection = np.array([0, 0.7660, 0.643])
     config.spindle_swing_offset = np.array([0, -250, 200])
+    config.tool_axis_sign = 1
     config.tool_length = 0
     config.linear_limits = {'X':(-245,455), 'Y':(-200,200), 'Z':(250,650)}
     # config.linear_limits = {'X': (-245, 455), 'Y': (-500, 500), 'Z': (0, 650)}
