@@ -4,6 +4,9 @@ from typing import Tuple, Optional, Dict, List
 from scipy.optimize import minimize
 import warnings
 
+# 设置全局输出格式（保留6位小数）
+np.set_printoptions(precision=6, suppress=True)  # suppress=True 防止科学计数法
+
 class MachineType(Enum):
     TABLE_TILTING = 1  # 两旋转轴在工作台 (如AC双转台)
     SPINDLE_TILTING = 2  # 两旋转轴在主轴 (如AB双摆头)
@@ -14,6 +17,93 @@ class RotaryAxis(Enum):
     A = 'A'  # 绕X轴旋转
     B = 'B'  # 绕Y轴旋转
     C = 'C'  # 绕Z轴旋转
+
+def _wrap180(a: float) -> float:
+    """把角度规范到 [-180, 180)"""
+    return (float(a) + 180.0) % 360.0 - 180.0
+
+def _basis_from_tool_dir(tool_dir: str) -> np.ndarray:
+    """X/Y/Z 基向量；用于从机床零位的刀轴基向量出发做旋转"""
+    if tool_dir == 'X':
+        return np.array([1.0, 0.0, 0.0])
+    elif tool_dir == 'Y':
+        return np.array([0.0, 1.0, 0.0])
+    else:
+        return np.array([0.0, 0.0, 1.0])
+
+def solve_rotary_angles_numeric(tool_direction: np.ndarray,
+                                machine,
+                                initial_guess=(0.0, 0.0),
+                                prev_angles=None) -> tuple:
+    """
+    只用刀轴方向求解两关节角：最小化 1 - dot(k(theta1,theta2), target_dir)
+    - 不用任何平移几何（枢轴距离、刀长、摆头偏置等）
+    - 自动处理“第二轴随第一轴转”的动轴效果
+    - 加一个很小的连续性正则，避免 180° 跳支
+    """
+    tool_direction = np.asarray(tool_direction, dtype=float)
+    nrm = np.linalg.norm(tool_direction)
+    if nrm < 1e-9:
+        return 0.0, 0.0
+    tool_direction /= nrm
+
+    # 连续性正则权重（可按需要微调；10^-6 一般足够）
+    lam = 1e-4
+    prev = prev_angles
+
+    # 角度边界（控制角的边界）
+    bounds = [
+        machine.config.rotary_limits[machine.config.rotary_axes[0].value],
+        machine.config.rotary_limits[machine.config.rotary_axes[1].value],
+    ]
+
+    def loss_fn(angles):
+        th1, th2 = float(angles[0]), float(angles[1])
+        k = machine._tool_axis_from_angles_direction_only(th1, th2)
+        dot = float(np.clip(np.dot(k, tool_direction), -1.0, 1.0))
+        loss = 1.0 - dot
+
+        if prev is not None:
+            da = np.radians(_wrap180(th1 - prev[0]))
+            db = np.radians(_wrap180(th2 - prev[1]))
+            loss += lam * (da*da + db*db)
+        return loss
+
+    # 优化
+    try:
+        res = minimize(
+            loss_fn,
+            x0=np.array(initial_guess, dtype=float),
+            bounds=bounds,
+            method='SLSQP',
+            options={'maxiter': 200, 'ftol': 1e-12}
+        )
+        if not res.success:
+            raise RuntimeError(res.message)
+
+        return _wrap180(res.x[0]), _wrap180(res.x[1])
+
+    except Exception:
+        # 兜底：粗扫一遍（步长 2°），仍然只按方向匹配
+        best = (initial_guess[0], initial_guess[1])
+        best_loss = 1e9
+        th1_min, th1_max = bounds[0]
+        th2_min, th2_max = bounds[1]
+
+        for th1 in np.linspace(th1_min, th1_max, int(max(2, (th1_max - th1_min) / 2) + 1)):
+            for th2 in np.linspace(th2_min, th2_max, int(max(2, (th2_max - th2_min) / 2) + 1)):
+                k = machine._tool_axis_from_angles_direction_only(th1, th2)
+                dot = float(np.clip(np.dot(k, tool_direction), -1.0, 1.0))
+                loss = 1.0 - dot
+                if prev is not None:
+                    da = _wrap180(th1 - prev[0])
+                    db = _wrap180(th2 - prev[1])
+                    loss += lam * (da * da + db * db)
+                if loss < best_loss:
+                    best_loss, best = loss, (th1, th2)
+
+        return _wrap180(best[0]), _wrap180(best[1])
+
 
 def _build_rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     """
@@ -38,144 +128,6 @@ def _build_rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     # Rodrigues 旋转公式：R = I + sinθ*K + (1-cosθ)*K^2
     R = np.eye(3) + sin_t * K + (1 - cos_t) * (K @ K)
     return R
-
-def rotation_error(theta1: float,
-                   theta2: float,
-                   n1: np.ndarray,
-                   n2: np.ndarray,
-                   tool_direction: np.ndarray,
-                   machine) -> float:
-    """
-    给定两个旋转角，计算当前刀具方向与目标刀具方向之间的角度误差（弧度）
-
-    参数:
-        theta1: 第一轴角度（deg）
-        theta2: 第二轴角度（deg）
-        n1: 第一轴单位向量
-        n2: 第二轴单位向量
-        tool_direction: 期望刀具方向单位向量
-        machine: 当前 KinematicSolver 实例
-
-    返回:
-        实际刀具方向与目标方向的夹角（弧度）
-    """
-    # 构建两个旋转矩阵（仅 3x3）
-    R1 = _build_rotation_matrix(n1, theta1)
-    R2 = _build_rotation_matrix(n2, theta2)
-
-    # 构建两个 4x4 齐次旋转矩阵
-    R1_hom = np.eye(4)
-    R1_hom[:3, :3] = R1
-
-    R2_hom = np.eye(4)
-    R2_hom[:3, :3] = R2
-
-    # 构建完整变换链（用于求解刀具方向）
-    T = (
-        machine.T_base_to_primary @
-        R1_hom @
-        machine.T_primary_to_secondary @
-        R2_hom @
-        machine.spindle_swing_matrix @
-        machine.T_secondary_to_tool
-    )
-
-    # 提取刀具方向（根据 config 中设定的刀具方向轴）
-    col_index = {'X': 0, 'Y': 1, 'Z': 2}[machine.config.tool_direction]
-    K_actual = T[:3, col_index]
-    K_actual = K_actual / np.linalg.norm(K_actual)
-
-    # 计算方向夹角（弧度）
-    dot = np.clip(np.dot(K_actual, tool_direction), -1.0, 1.0)
-    angle_error = np.arccos(dot)
-    return angle_error
-
-
-def solve_rotary_angles_numeric(tool_direction: np.ndarray,
-                                machine,
-                                initial_guess=(0.0, 0.0)) -> tuple:
-    """
-    使用数值优化方式求解逆运动学中的两个旋转角度（适用于偏心旋转轴）。
-    若优化失败，自动回退为简化近似解。
-
-    参数:
-        tool_direction: 目标刀具方向（单位向量）
-        machine: KinematicSolver 实例
-        initial_guess: 初始角度猜测 (θ1, θ2)，单位为度
-
-    返回:
-        (θ1, θ2): 优化求解的角度解（单位为度）
-    """
-
-    # ---------- 1. 归一化方向 ----------
-    tool_direction = np.asarray(tool_direction, dtype=float)
-    norm = np.linalg.norm(tool_direction)
-    if norm < 1e-6:
-        print("[警告] 输入的刀具方向向量太小，可能为零向量")
-        return 0.0, 0.0
-    tool_direction /= norm
-
-    # ---------- 2. 提取旋转轴信息 ----------
-    n1 = machine.primary_axis
-    n2 = machine.secondary_axis
-
-    # ---------- 3. 构造损失函数 ----------
-    def loss_fn(angles):
-        theta1, theta2 = angles
-        return rotation_error(theta1, theta2, n1, n2, tool_direction, machine)
-
-    # ---------- 4. 设定角度范围 ----------
-    bounds = [
-        machine.config.rotary_limits[machine.config.rotary_axes[0].value],
-        machine.config.rotary_limits[machine.config.rotary_axes[1].value],
-    ]
-
-    # ---------- 5. 进行优化 ----------
-    try:
-        result = minimize(
-            loss_fn,
-            x0=np.array(initial_guess, dtype=float),
-            bounds=bounds,
-            method='SLSQP',
-            options={'maxiter': 100, 'ftol': 1e-9}
-        )
-
-        if result.success:
-            # ---------- 6. 正常返回 ----------
-            def normalize(angle):
-                return (angle + 180) % 360 - 180
-
-            theta1 = normalize(result.x[0])
-            theta2 = normalize(result.x[1])
-            return theta1, theta2
-
-        else:
-            raise RuntimeError(result.message)
-
-    except Exception as e:
-        # ---------- 7. 失败时回退处理 ----------
-        print("\n[❌ 数值求解失败，自动回退简化解]")
-        print(f"失败信息: {str(e)}")
-        print(f"→ 工具方向: {tool_direction}")
-        print(f"→ 初始角度猜测: {initial_guess}")
-        print(f"→ 回退方式: 固定第二轴为初始值，粗略估算第一轴")
-
-        # 用固定初始的第二轴角度，快速估算第一轴角度
-        theta2 = initial_guess[1]
-
-        def quick_theta1_estimate():
-            min_error = float("inf")
-            best_theta1 = initial_guess[0]
-            for t in np.linspace(-180, 180, 73):  # 每隔 5°
-                err = rotation_error(t, theta2, n1, n2, tool_direction, machine)
-                if err < min_error:
-                    min_error = err
-                    best_theta1 = t
-            return best_theta1
-
-        theta1 = quick_theta1_estimate()
-
-        return theta1, theta2
 
 
 class MachineConfig:
@@ -266,6 +218,38 @@ class KinematicSolver:
             raise ValueError("非双转台需要定义第二旋转中心到主轴的偏移")
         if self.config.tool_length < 0:
             raise ValueError("刀具长度必须大于等于0")
+
+    def _tool_axis_from_angles_direction_only(self, theta1_deg: float, theta2_deg: float) -> np.ndarray:
+        """
+        仅根据两关节角（“控制角”，即 IK 要返回的角）求刀轴方向（世界系）。
+        关键点：第二轴是“动轴”，其瞬时轴向 n2_eff = R1 @ n2。
+        同时考虑每轴的旋向 sign 与 tool_axis_sign。
+        """
+        # 轴向（世界系单位向量）
+        n1 = self.primary_axis / np.linalg.norm(self.primary_axis)
+        n2 = self.secondary_axis / np.linalg.norm(self.secondary_axis)
+
+        # 控制角 -> 物理旋转角（考虑旋向）
+        th1 = float(theta1_deg) * float(self.primary_rotation_sign)
+        th2 = float(theta2_deg) * float(self.secondary_rotation_sign)
+
+        # 第一轴旋转
+        R1 = _build_rotation_matrix(n1, th1)  # 3x3（注意这里用的是模块级的 _build_rotation_matrix）
+
+        # 第二轴随动后的轴向（世界系）
+        n2_eff = R1 @ n2
+        R2 = _build_rotation_matrix(n2_eff, th2)  # 3x3
+
+        # 总旋转
+        R = R1 @ R2
+
+        # 零位刀轴 + 正负号
+        e_tool = _basis_from_tool_dir(self.config.tool_direction) * float(getattr(self.config, "tool_axis_sign", +1))
+
+        k = R @ e_tool
+        k /= np.linalg.norm(k)
+        return k
+
 
     def _build_transformation_matrices(self):
         """
@@ -450,7 +434,9 @@ class KinematicSolver:
         T_first_to_second_center = self.T_primary_to_secondary
 
         # 第二轴旋转（关于 secondary_axis，角度 second_angle）
-        R_second_axis = self._build_rotation_matrix(self.secondary_axis, second_angle)
+        n2_eff = R_first_axis[:3, :3] @ (self.secondary_axis / np.linalg.norm(self.secondary_axis))
+        R_second_axis = self._build_rotation_matrix(n2_eff, second_angle)
+        # R_second_axis = self._build_rotation_matrix(self.secondary_axis, second_angle)
 
         # 第二轴到刀具（包含摆头偏移与刀具长度偏移）
         T_second_to_tool = self.spindle_swing_matrix @ self.T_secondary_to_tool
@@ -465,17 +451,22 @@ class KinematicSolver:
         # 4. 提取刀具位置（齐次矩阵的平移分量）
         position = T_total[:3, 3].astype(float)
 
-        # 5. 提取刀具方向向量：取变换矩阵的第 tool_dir_index 列（0->X,1->Y,2->Z）
-        tool_dir_index = _TOOL_DIRECTION_MAP.get(self.config.tool_direction, 2)
-        orientation = T_total[:3, tool_dir_index].astype(float)
-        # 应用刀轴符号（+1 取正列，-1 取反列）
-        orientation *= float(getattr(self.config, "tool_axis_sign", +1))
+        # # 5. 提取刀具方向向量：取变换矩阵的第 tool_dir_index 列（0->X,1->Y,2->Z）
+        # tool_dir_index = _TOOL_DIRECTION_MAP.get(self.config.tool_direction, 2)
+        # orientation = T_total[:3, tool_dir_index].astype(float)
+        # # 应用刀轴符号（+1 取正列，-1 取反列）
+        # orientation *= float(getattr(self.config, "tool_axis_sign", +1))
 
-        # 6. 归一化方向并返回（并在异常情况下提供诊断）
-        norm = np.linalg.norm(orientation)
-        if norm < 1e-9:
-            raise ValueError("Computed tool orientation has near-zero length; check axes/deflection settings.")
-        orientation = orientation / norm
+        # # 6. 归一化方向并返回（并在异常情况下提供诊断）
+        # norm = np.linalg.norm(orientation)
+        # if norm < 1e-9:
+        #     raise ValueError("Computed tool orientation has near-zero length; check axes/deflection settings.")
+        # orientation = orientation / norm
+        # 新（只改方向计算）：
+        orientation = self._tool_axis_from_angles_direction_only(
+            joint_values.get(self.config.rotary_axes[0].value, 0.0),
+            joint_values.get(self.config.rotary_axes[1].value, 0.0)
+        )
 
         return position, orientation
 
@@ -958,7 +949,8 @@ class KinematicSolver:
                 print(f"解析解失败，使用数值解: {e}")
 
         # 有偏转或解析失败的通用处理
-        numeric_angles = solve_rotary_angles_numeric(tool_dir_local, self, prev_angles or (0.0, 0.0))
+        # numeric_angles = solve_rotary_angles_numeric(tool_dir_local, self, prev_angles or (0.0, 0.0))
+        numeric_angles = solve_rotary_angles_numeric(tool_dir_local, self, initial_guess=(0.0, 0.0), prev_angles=prev_angles)
         return [numeric_angles]
 
     def _calculate_linear_position(self,
@@ -977,15 +969,16 @@ class KinematicSolver:
 
         # 构建旋转矩阵
         R1 = self._build_rotation_matrix(self.primary_axis, angle_fst)
-        R2 = self._build_rotation_matrix(self.secondary_axis, angle_sec)
 
+        n2_eff = R1[:3, :3] @ (self.secondary_axis / np.linalg.norm(self.secondary_axis))
+        R2 = self._build_rotation_matrix(n2_eff, angle_sec)
         # M_fixed 应该包括 spindle_swing_matrix
         M_fixed = (
                 self.T_base_to_primary @
                 R1 @
                 self.T_primary_to_secondary @
                 R2 @
-                self.spindle_swing_matrix @  # 缺失部分
+                self.spindle_swing_matrix @
                 self.T_secondary_to_tool
         )
 
@@ -1066,7 +1059,7 @@ if __name__ == '__main__':
     config.primary_rotary_center = np.array([455, 0, 650])
     # config.secondary_rotary_offset = np.array([0, 429.813, 457.164])
     config.secondary_rotary_offset = np.array([-455, 250, -850])
-    # config.secondary_deflection = np.array([0, 0.7660, 0.643])
+    config.secondary_deflection = np.array([0, 0.7660, 0.643])
     config.spindle_swing_offset = np.array([0, -250, 200])
     config.tool_axis_sign = 1
     config.tool_length = 0
@@ -1109,3 +1102,9 @@ if __name__ == '__main__':
     fk_pos, fk_dir = solver.forward_kinematics(ik_result)
     print("正向解算结果位置:", fk_pos)
     print("正向解算结果方向:", fk_dir)
+
+    th1 = ik_result['A']
+    th2 = ik_result['B']
+    k_num = solver._tool_axis_from_angles_direction_only(th1, th2)
+    print("||k_num|| =", np.linalg.norm(k_num))          # 必须接近 1
+    print("dot(k_num, target) =", np.dot(k_num, target_orientation))  # 必须接近 1

@@ -104,9 +104,20 @@ class GCodeParser:
         # 重置解析行
         self.parsed_lines = []
 
+        lines_num = end_idx - start_idx
+        delta_line = (end_idx - start_idx) / 100
+        percent = 0
+
         # 开始解析
         for i in range(start_idx, end_idx):
             line = self.original_lines[i].strip()
+            
+            # 计算进度百分比
+            if delta_line > 0:
+                current_percent = int((i - start_idx) / delta_line)
+                if current_percent > percent:
+                    percent = current_percent
+                    print(f"解析进度: {percent}% ({i - start_idx + 1}/{lines_num})")
             
             if not line:  # 空行保持不变
                 continue
