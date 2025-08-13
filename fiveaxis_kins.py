@@ -894,36 +894,29 @@ class KinematicSolver:
         first_axis = self.config.rotary_axes[0].value
         second_axis = self.config.rotary_axes[1].value
 
-        # 计算所有可能的旋转角度组合
-        angle_solutions = self._calculate_rotation_angles(tool_orientation, prev_angles)
+        # 计算旋转角度组合
+        angles = self._calculate_rotation_angles(tool_orientation, prev_angles)
 
         # 计算对应的线性轴位置并验证行程
-        valid_solutions = []
-        for angles in angle_solutions:
-            linear_pos = self._calculate_linear_position(tool_position, angles)
-            solution = {
-                'X': linear_pos['X'],
-                'Y': linear_pos['Y'],
-                'Z': linear_pos['Z'],
-                first_axis: angles[0],
-                second_axis: angles[1]
-            }
+        linear_pos = self._calculate_linear_position(tool_position, angles)
+        solution = {
+            'X': linear_pos['X'],
+            'Y': linear_pos['Y'],
+            'Z': linear_pos['Z'],
+            first_axis: angles[0],
+            second_axis: angles[1]
+        }
 
-            # 检查行程限制
-            # if self._check_limits(solution):
-            valid_solutions.append(solution)
+        # 检查行程限制
+        # if self._check_limits(solution) is False:
+        #     raise ValueError("逆解结果超出机床行程限制")
 
-        if not valid_solutions:
-            raise ValueError("无法找到满足限制的逆解")
 
-        # 选择最优解（最接近前一个位置）
-        best_solution = self._select_best_solution(valid_solutions, prev_angles)
-
-        return best_solution
+        return solution
 
     def _calculate_rotation_angles(self,
                                    tool_orientation: np.ndarray,
-                                   prev_angles: Optional[Tuple[float, float]]) -> List[Tuple[float, float]]:
+                                   prev_angles: Optional[Tuple[float, float]]) -> Tuple[float, float]:
         """
         计算所有可能的旋转角度组合
         - 若无轴偏转，尝试使用解析法
@@ -949,9 +942,8 @@ class KinematicSolver:
                 print(f"解析解失败，使用数值解: {e}")
 
         # 有偏转或解析失败的通用处理
-        # numeric_angles = solve_rotary_angles_numeric(tool_dir_local, self, prev_angles or (0.0, 0.0))
         numeric_angles = solve_rotary_angles_numeric(tool_dir_local, self, initial_guess=(0.0, 0.0), prev_angles=prev_angles)
-        return [numeric_angles]
+        return numeric_angles
 
     def _calculate_linear_position(self,
                                    tool_position: np.ndarray,
@@ -1026,30 +1018,6 @@ class KinematicSolver:
                 return False
 
         return True
-
-    def _select_best_solution(self,
-                              solutions: List[Dict[str, float]],
-                              prev_angles: Optional[Tuple[float, float]]) -> Dict[str, float]:
-        """从多个解中选择最优解"""
-        if prev_angles is None or not solutions:
-            return solutions[0]
-
-        # 计算与前一个位置的距离（优先考虑旋转轴连续性）
-        def distance(solution):
-            rot_dist = 0
-            first_axis = self.config.rotary_axes[0].value
-            second_axis = self.config.rotary_axes[1].value
-
-            # 旋转轴距离（考虑角度环绕）
-            a_diff = abs(solution[first_axis] - prev_angles[0])
-            a_diff = min(a_diff, 360 - a_diff)
-
-            c_diff = abs(solution[second_axis] - prev_angles[1])
-            c_diff = min(c_diff, 360 - c_diff)
-
-            return a_diff + c_diff
-
-        return min(solutions, key=distance)
 
 if __name__ == '__main__':
     # 创建配置
