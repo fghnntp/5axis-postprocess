@@ -936,7 +936,7 @@ class KinematicSolver:
                 else:
                     base_angles = self._solve_hybrid_angles(tool_dir_local, prev_angles)
 
-                return [base_angles]
+                return base_angles
             except Exception as e:
                 # 回退使用数值优化法
                 print(f"解析解失败，使用数值解: {e}")
